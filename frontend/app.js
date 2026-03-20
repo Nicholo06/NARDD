@@ -17,7 +17,7 @@ const interfaceSelect = document.getElementById('interface-select');
 let alertCount = 0;
 let ws;
 let isAdvancedMode = false;
-let blockedMacs = [];
+let blockedMacs = []; // Now stores [mac, ip] pairs
 let devices = [];
 
 // Tab Logic
@@ -76,7 +76,6 @@ scanBtn.onclick = async () => {
     try {
         const response = await fetch(`${API_URL}/scan`, { method: 'POST' });
         const result = await response.json();
-        console.log(result.message);
         fetchDevices();
     } catch (e) { console.error(e); }
     scanBtn.disabled = false;
@@ -135,14 +134,12 @@ function updateDeviceInMemory(mac, ip) {
         dev.ip_address = ip;
         dev.last_seen = new Date().toISOString();
     } else {
-        // Optimistically add the new device so it shows up instantly
         devices.push({
             mac_address: mac,
             ip_address: ip,
             is_trusted: false,
             last_seen: new Date().toISOString()
         });
-        // Still fetch in background to sync with DB
         setTimeout(fetchDevices, 1000);
     }
     renderDevices();
@@ -154,7 +151,8 @@ function renderDevices() {
 
     devices.forEach(device => {
         const tr = document.createElement('tr');
-        const isBlocked = blockedMacs.includes(device.mac_address);
+        // Check if [mac, ip] is in blockedMacs
+        const isBlocked = blockedMacs.some(b => b[0] === device.mac_address && b[1] === device.ip_address);
         tr.className = `transition ${isBlocked ? 'bg-red-900/20' : 'hover:bg-gray-700/30'}`;
         
         const lastSeen = new Date(device.last_seen).toLocaleTimeString();
@@ -169,7 +167,7 @@ function renderDevices() {
 
         if (isAdvancedMode) {
             actionHtml += `
-                <button onclick="toggleBlock('${device.mac_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-sm font-semibold">
+                <button onclick="toggleBlock('${device.mac_address}', '${device.ip_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-sm font-semibold">
                     ${isBlocked ? 'UNBLOCK' : 'BLOCK'}
                 </button>
             `;
@@ -193,7 +191,6 @@ function createAlertElement(alert, animate = true) {
     const div = document.createElement('div');
     const isCritical = alert.severity === 'CRITICAL';
     const time = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
-    
     div.className = `p-3 rounded-lg border text-sm ${animate ? 'animate-pulse' : ''} ${isCritical ? 'bg-red-900/40 border-red-700' : 'bg-indigo-900/20 border-indigo-800'}`;
     div.innerHTML = `
         <div class="flex justify-between items-start mb-1">
@@ -216,9 +213,9 @@ async function toggleTrust(mac, isTrusted) {
     fetchDevices();
 }
 
-async function toggleBlock(mac, shouldBlock) {
+async function toggleBlock(mac, ip, shouldBlock) {
     const endpoint = shouldBlock ? 'block' : 'unblock';
-    await fetch(`${API_URL}/devices/${mac}/${endpoint}`, { method: 'POST' });
+    await fetch(`${API_URL}/devices/${mac}/${endpoint}?ip=${ip}`, { method: 'POST' });
     fetchDevices();
 }
 
