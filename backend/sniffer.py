@@ -21,7 +21,7 @@ class DatabaseWorker(threading.Thread):
                 if task is None: break
                 db = SessionLocal()
                 try: task[0](db, *task[1], **task[2])
-                except: pass # Suppress DB errors in worker
+                except: pass
                 finally: db.close()
             except: pass
 
@@ -82,6 +82,8 @@ class NetworkSniffer:
         self.blocker = ActiveBlocker(); self.blocker.start()
         self.alert_cooldown = {}
         self.vendor_cache = {}
+        # Tracking for scan detection
+        self.scan_tracker = {} # mac -> {ips: set, last_reset: timestamp}
 
     def get_interfaces(self): return get_if_list()
     def set_interface(self, iface): self.interface = iface; self.blocker.refresh_network_info(iface)
@@ -101,32 +103,23 @@ class NetworkSniffer:
         return "Unknown Vendor"
 
     def interrogate_device(self, ip, mac):
-        """Active Fingerprinting: OS & Device Detection"""
         if ip == self.blocker.gateway_ip:
             self._update_info(mac, hostname="Default Gateway", vendor="Network Router")
             return
-        # 1. TTL Analysis - Remove iface from sr1 to fix SyntaxWarning
         try:
             ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False)
-            if ans and ans.ttl <= 64:
-                self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
-            elif ans and ans.ttl > 64:
-                self._update_info(mac, vendor="Windows Device (TTL 128)")
+            if ans and ans.ttl <= 64: self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
+            elif ans and ans.ttl > 64: self._update_info(mac, vendor="Windows Device (TTL 128)")
         except: pass
-        # 2. Apple Lockdown Port Probe
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
-                if s.connect_ex((ip, 62078)) == 0:
-                    self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc.")
+                if s.connect_ex((ip, 62078)) == 0: self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc.")
         except: pass
-        # 3. NetBIOS Name Query
         try:
             pkt = IP(dst=ip)/UDP(sport=137, dport=137)/NBNSNodeStatusRequest()
             ans = srp(Ether(dst=mac)/pkt, timeout=1, verbose=False, iface=self.interface)[0]
-            if ans:
-                raw_name = ans[0][1].getlayer(NBNSNodeStatusRequest).NAME
-                self._update_info(mac, hostname=raw_name.decode().strip())
+            if ans: self._update_info(mac, hostname=ans[0][1].getlayer(NBNSNodeStatusRequest).NAME.decode().strip())
         except: pass
 
     def scan_network(self):
@@ -147,6 +140,13 @@ class NetworkSniffer:
             if extra: data.update(extra)
             self.alert_callback(data)
 
+    def should_alert(self, key, cooldown=60):
+        now = datetime.now()
+        if key in self.alert_cooldown:
+            if now < self.alert_cooldown[key] + timedelta(seconds=cooldown): return False
+        self.alert_cooldown[key] = now
+        return True
+
     def _update_info(self, mac, hostname=None, vendor=None):
         db = SessionLocal()
         try:
@@ -160,28 +160,53 @@ class NetworkSniffer:
 
     def process_packet(self, packet):
         try:
+            # 1. ARP Monitoring & Scan Detection
             if packet.haslayer(ARP):
                 psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
+                pdst = packet[ARP].pdst
+                
                 db = SessionLocal()
                 try:
                     device = crud.get_device_by_mac(db, hwsrc)
+                    
+                    # Scan Detection for Untrusted Devices
+                    if device and not device.is_trusted and packet[ARP].op == 1: # ARP Request
+                        if hwsrc not in self.scan_tracker:
+                            self.scan_tracker[hwsrc] = {"ips": set(), "start": time.time()}
+                        
+                        tracker = self.scan_tracker[hwsrc]
+                        tracker["ips"].add(pdst)
+                        
+                        # If device pings more than 10 IPs in 30 seconds
+                        if len(tracker["ips"]) > 10:
+                            if self.should_alert(f"SCAN_{hwsrc}", cooldown=300):
+                                self.send_alert("SCAN_DETECTION", "WARNING", f"Untrusted device {hwsrc} is scanning the network!", {"mac": hwsrc})
+                            tracker["ips"].clear() # Reset
+                        elif time.time() - tracker["start"] > 30:
+                            tracker["ips"].clear(); tracker["start"] = time.time()
+
                     if not device:
                         vendor = self.get_vendor(hwsrc)
-                        # Use try-except here to catch race condition duplicates
                         try:
                             crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc, vendor=vendor))
                             self.send_alert("NEW_DEVICE", "INFO", f"New device: {vendor} ({psrc})", {"mac": hwsrc, "ip": psrc, "vendor": vendor})
                             threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
-                        except: pass # Likely already created by another thread
+                        except: pass
                     else:
                         if device.ip_address != psrc:
                             other = crud.get_device_by_ip(db, psrc)
                             if other and other.mac_address != hwsrc:
                                 if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
-                            else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
+                            else:
+                                # Alert if an UNTRUSTED device moves IPs
+                                if not device.is_trusted:
+                                    if self.should_alert(f"MOVE_{hwsrc}"):
+                                        self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved from {device.ip_address} to {psrc}")
+                                self.queue_task(crud.update_device_ip, hwsrc, psrc)
                         else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
                 finally: db.close()
 
+            # 2. Other Protocols (DHCP, NBNS, etc.)
             if packet.haslayer(DHCP):
                 mac = packet[Ether].src; options = packet[DHCP].options
                 for opt in options:
