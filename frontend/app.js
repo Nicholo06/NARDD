@@ -17,7 +17,7 @@ const interfaceSelect = document.getElementById('interface-select');
 let alertCount = 0;
 let ws;
 let isAdvancedMode = false;
-let blockedMacs = []; // Now stores [mac, ip] pairs
+let blockedMacs = [];
 let devices = [];
 
 // Tab Logic
@@ -75,7 +75,6 @@ scanBtn.onclick = async () => {
     scanBtn.textContent = "Scanning...";
     try {
         const response = await fetch(`${API_URL}/scan`, { method: 'POST' });
-        const result = await response.json();
         fetchDevices();
     } catch (e) { console.error(e); }
     scanBtn.disabled = false;
@@ -108,9 +107,18 @@ function connectWS() {
     };
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        addAlert(data);
-        if (data.mac) updateDeviceInMemory(data.mac, data.ip);
-        else fetchDevices();
+        if (data.type === "INFO_UPDATE") {
+            const dev = devices.find(d => d.mac_address === data.mac);
+            if (dev) {
+                if (data.hostname) dev.hostname = data.hostname;
+                if (data.vendor) dev.vendor = data.vendor;
+                renderDevices();
+            }
+        } else {
+            addAlert(data);
+            if (data.mac) updateDeviceInMemory(data.mac, data.ip, data.vendor);
+            else fetchDevices();
+        }
     };
     ws.onclose = () => {
         statusDot.className = "relative inline-flex rounded-full h-3 w-3 bg-red-500";
@@ -128,15 +136,17 @@ async function fetchDevices() {
     } catch (error) { console.error(error); }
 }
 
-function updateDeviceInMemory(mac, ip) {
+function updateDeviceInMemory(mac, ip, vendor) {
     const dev = devices.find(d => d.mac_address === mac);
     if (dev) {
         dev.ip_address = ip;
         dev.last_seen = new Date().toISOString();
+        if (vendor) dev.vendor = vendor;
     } else {
         devices.push({
             mac_address: mac,
             ip_address: ip,
+            vendor: vendor || "Unknown",
             is_trusted: false,
             last_seen: new Date().toISOString()
         });
@@ -151,7 +161,6 @@ function renderDevices() {
 
     devices.forEach(device => {
         const tr = document.createElement('tr');
-        // Check if [mac, ip] is in blockedMacs
         const isBlocked = blockedMacs.some(b => b[0] === device.mac_address && b[1] === device.ip_address);
         tr.className = `transition ${isBlocked ? 'bg-red-900/20' : 'hover:bg-gray-700/30'}`;
         
@@ -173,14 +182,20 @@ function renderDevices() {
             `;
         }
 
+        const deviceName = device.hostname || "---";
+        const vendorName = device.vendor || "Unknown Vendor";
+
         tr.innerHTML = `
-            <td class="px-6 py-4 font-mono text-xs text-gray-300">
-                ${device.mac_address}
-                ${isBlocked ? '<span class="ml-2 bg-red-600 text-[8px] px-1 rounded text-white font-bold">BLOCKED</span>' : ''}
+            <td class="px-6 py-4">
+                <div class="text-sm font-bold text-gray-100">${deviceName}</div>
+                <div class="text-[10px] text-gray-500 font-mono">${device.mac_address}</div>
             </td>
-            <td class="px-6 py-4 text-gray-100">${device.ip_address}</td>
-            <td class="px-6 py-4 ${statusClass} font-medium">${statusIcon}</td>
-            <td class="px-6 py-4 text-gray-400 text-sm">${lastSeen}</td>
+            <td class="px-6 py-4">
+                <div class="text-sm text-gray-200">${device.ip_address}</div>
+                <div class="text-[10px] text-indigo-400 font-medium">${vendorName}</div>
+            </td>
+            <td class="px-6 py-4 ${statusClass} font-medium text-xs">${statusIcon}</td>
+            <td class="px-6 py-4 text-gray-400 text-xs">${lastSeen}</td>
             <td class="px-6 py-4">${actionHtml}</td>
         `;
         deviceTableBody.appendChild(tr);

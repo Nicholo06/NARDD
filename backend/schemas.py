@@ -6,6 +6,7 @@ class DeviceBase(BaseModel):
     mac_address: str
     ip_address: str
     hostname: Optional[str] = None
+    vendor: Optional[str] = None
     is_trusted: bool = False
 
 class DeviceCreate(DeviceBase):

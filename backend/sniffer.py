@@ -1,9 +1,10 @@
-from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip
+from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, UDP, DNS, DNSQR
 import threading
 import time
 import platform
 import queue
 import os
+import requests
 from datetime import datetime, timedelta
 from .database import SessionLocal
 from . import crud, schemas
@@ -41,23 +42,8 @@ class ActiveBlocker:
     def refresh_network_info(self, interface):
         self.interface = interface
         try:
-            # Check IP Forwarding on Linux
-            if platform.system() == "Linux":
-                with open("/proc/sys/net/ipv4/ip_forward", "r") as f:
-                    if f.read().strip() == "1":
-                        print("\n[⚠️] WARNING: IP Forwarding is ENABLED on your Kali laptop.")
-                        print("[⚠️] Your laptop is FORWARDING blocked traffic instead of dropping it.")
-                        print("[⚠️] Run this to fix: sudo sysctl -w net.ipv4.ip_forward=0\n")
-
             self.local_mac = get_if_hwaddr(self.interface or conf.iface)
-            print(f"[*] Resolving Gateway MAC for {self.gateway_ip}...")
             self.gateway_mac = getmacbyip(self.gateway_ip)
-            
-            if not self.gateway_mac:
-                # Fallback: Try a broadcast ARP to find gateway
-                ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=self.gateway_ip), timeout=2, verbose=False, iface=self.interface)
-                if ans: self.gateway_mac = ans[0][1].hwsrc
-
             print(f"[*] BLOCKER STATUS: GW_MAC={self.gateway_mac}, Local_MAC={self.local_mac}, Iface={self.interface or 'Default'}")
         except Exception as e:
             print(f"[!] Blocker Init Error: {e}")
@@ -70,14 +56,11 @@ class ActiveBlocker:
 
     def block(self, mac, ip):
         self.blocked_macs.add((mac, ip))
-        print(f"[🔥] BLOCKING START: {mac} ({ip})")
 
     def unblock(self, mac, ip):
         if (mac, ip) in self.blocked_macs:
             self.blocked_macs.remove((mac, ip))
-            print(f"[✅] BLOCKING STOP: {mac} ({ip})")
-            for _ in range(5): # Send restoration burst
-                self.restore(mac, ip)
+            for _ in range(5): self.restore(mac, ip)
 
     def restore(self, target_mac, target_ip):
         if not self.gateway_mac: return
@@ -89,26 +72,19 @@ class ActiveBlocker:
         except: pass
 
     def run(self):
-        print("Active Blocker engine online.")
         while not self.stop_event.is_set():
             if not self.gateway_mac or not self.local_mac:
                 self.refresh_network_info(self.interface)
                 time.sleep(3)
                 continue
-
             for mac, ip in list(self.blocked_macs):
                 try:
-                    # High-Intensity Bi-directional Poisoning
-                    # Tell Target we are the Gateway
                     p1 = ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.local_mac)
-                    # Tell Gateway we are the Target
                     p2 = ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=ip, hwsrc=self.local_mac)
-                    
                     send(p1, verbose=False, iface=self.interface)
                     send(p2, verbose=False, iface=self.interface)
                 except: pass
-            
-            time.sleep(0.5) # Fast 500ms cycle to beat modern ARP protections
+            time.sleep(0.5)
 
 class NetworkSniffer:
     def __init__(self, alert_callback=None):
@@ -121,6 +97,7 @@ class NetworkSniffer:
         self.blocker = ActiveBlocker()
         self.blocker.start()
         self.alert_cooldown = {}
+        self.vendor_cache = {}
 
     def get_interfaces(self): return get_if_list()
     def set_interface(self, iface):
@@ -132,6 +109,18 @@ class NetworkSniffer:
             "can_inject": True, "gateway": self.blocker.gateway_ip,
             "current_interface": self.interface or "Default"
         }
+
+    def get_vendor(self, mac):
+        prefix = mac.upper().replace(":", "")[:6]
+        if prefix in self.vendor_cache: return self.vendor_cache[prefix]
+        try:
+            # Using a free MAC API
+            response = requests.get(f"https://api.macvendors.com/{mac}", timeout=1)
+            if response.status_code == 200:
+                self.vendor_cache[prefix] = response.text
+                return response.text
+        except: pass
+        return "Unknown"
 
     def scan_network(self):
         try:
@@ -154,30 +143,62 @@ class NetworkSniffer:
             self.alert_callback(data)
 
     def process_packet(self, packet):
-        if not packet.haslayer(ARP): return
-        psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
-        db = SessionLocal()
-        try:
-            device = crud.get_device_by_mac(db, hwsrc)
-            if not device:
-                crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc))
-                self.send_alert("NEW_DEVICE", "INFO", f"New device: {hwsrc} ({psrc})", {"mac": hwsrc, "ip": psrc})
-            else:
-                if device.ip_address != psrc:
-                    other = crud.get_device_by_ip(db, psrc)
-                    if other and other.mac_address != hwsrc:
-                        if self.should_alert(f"SPOOF_{psrc}"):
-                            self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
+        # 1. Handle ARP (Device discovery and Spoof detection)
+        if packet.haslayer(ARP):
+            psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
+            db = SessionLocal()
+            try:
+                device = crud.get_device_by_mac(db, hwsrc)
+                if not device:
+                    vendor = self.get_vendor(hwsrc)
+                    crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc, vendor=vendor))
+                    self.send_alert("NEW_DEVICE", "INFO", f"New device: {vendor} ({psrc})", {"mac": hwsrc, "ip": psrc, "vendor": vendor})
+                else:
+                    if device.ip_address != psrc:
+                        other = crud.get_device_by_ip(db, psrc)
+                        if other and other.mac_address != hwsrc:
+                            if self.should_alert(f"SPOOF_{psrc}"):
+                                self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
+                        else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
                     else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
-                else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
-        finally: db.close()
+            finally: db.close()
+
+        # 2. Handle Hostname Discovery (NBNS for Windows, MDNS for Apple/Linux)
+        if packet.haslayer(NBNSQueryRequest):
+            name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
+            ip = packet[IP].src if packet.haslayer(IP) else None
+            if name and ip:
+                self.queue_task(self._update_hostname_by_ip, ip, name)
+
+        if packet.haslayer(DNS) and packet.haslayer(UDP) and packet[UDP].dport == 5353: # MDNS
+            try:
+                for i in range(packet[DNS].ancount):
+                    res = packet[DNS].an[i]
+                    if res.type == 12: # PTR Record
+                        name = res.rdata.decode().split(".")[0]
+                        ip = packet[IP].src if packet.haslayer(IP) else None
+                        if name and ip:
+                            self.queue_task(self._update_hostname_by_ip, ip, name)
+            except: pass
+
+    def _update_hostname_by_ip(self, db, ip, hostname):
+        device = crud.get_device_by_ip(db, ip)
+        if device and (not device.hostname or device.hostname != hostname):
+            crud.update_device_info(db, device.mac_address, hostname=hostname)
+            # Notify frontend of info update
+            if self.alert_callback:
+                self.alert_callback({"type": "INFO_UPDATE", "mac": device.mac_address, "hostname": hostname})
 
     def run(self):
-        try: sniff(iface=self.interface, filter="arp", prn=self.process_packet, store=0, stop_filter=lambda x: self.stop_event.is_set())
-        except: pass
+        try:
+            # Sniff ARP, NBNS, and MDNS
+            sniff(iface=self.interface, filter="arp or udp port 137 or udp port 5353", prn=self.process_packet, store=0, stop_filter=lambda x: self.stop_event.is_set())
+        except Exception as e: print(f"[!] SNIFFER ERROR: {e}")
+
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
+
     def stop(self):
         self.stop_event.set()
         self.db_queue.put(None)

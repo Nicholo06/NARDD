@@ -9,6 +9,7 @@ class Device(Base):
     mac_address = Column(String, unique=True, index=True)
     ip_address = Column(String)
     hostname = Column(String, nullable=True)
+    vendor = Column(String, nullable=True)
     is_trusted = Column(Boolean, default=False)
     last_seen = Column(DateTime, default=datetime.utcnow)
 

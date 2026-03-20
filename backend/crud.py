@@ -24,6 +24,15 @@ def update_device_ip(db: Session, mac_address: str, ip_address: str):
         db.refresh(db_device)
     return db_device
 
+def update_device_info(db: Session, mac_address: str, hostname: str = None, vendor: str = None):
+    db_device = get_device_by_mac(db, mac_address)
+    if db_device:
+        if hostname: db_device.hostname = hostname
+        if vendor: db_device.vendor = vendor
+        db.commit()
+        db.refresh(db_device)
+    return db_device
+
 def update_device_trust(db: Session, mac_address: str, is_trusted: bool):
     db_device = get_device_by_mac(db, mac_address)
     if db_device:
