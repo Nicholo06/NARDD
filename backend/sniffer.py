@@ -1,10 +1,11 @@
-from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, UDP, DNS, DNSQR
+from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, UDP, DNS, IP, DHCP, BOOTP
 import threading
 import time
 import platform
 import queue
 import os
 import requests
+import re
 from datetime import datetime, timedelta
 from .database import SessionLocal
 from . import crud, schemas
@@ -44,9 +45,7 @@ class ActiveBlocker:
         try:
             self.local_mac = get_if_hwaddr(self.interface or conf.iface)
             self.gateway_mac = getmacbyip(self.gateway_ip)
-            print(f"[*] BLOCKER STATUS: GW_MAC={self.gateway_mac}, Local_MAC={self.local_mac}, Iface={self.interface or 'Default'}")
-        except Exception as e:
-            print(f"[!] Blocker Init Error: {e}")
+        except: pass
 
     def start(self):
         if not self.thread:
@@ -54,9 +53,7 @@ class ActiveBlocker:
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
 
-    def block(self, mac, ip):
-        self.blocked_macs.add((mac, ip))
-
+    def block(self, mac, ip): self.blocked_macs.add((mac, ip))
     def unblock(self, mac, ip):
         if (mac, ip) in self.blocked_macs:
             self.blocked_macs.remove((mac, ip))
@@ -103,6 +100,7 @@ class NetworkSniffer:
     def set_interface(self, iface):
         self.interface = iface
         self.blocker.refresh_network_info(iface)
+
     def get_capabilities(self):
         return {
             "os": platform.system(), "is_linux": platform.system() == "Linux",
@@ -111,16 +109,21 @@ class NetworkSniffer:
         }
 
     def get_vendor(self, mac):
+        # Check for Randomized MAC (Private Wi-Fi Address)
+        # If the second character of MAC is 2, 6, A, or E, it's a randomized MAC
+        second_char = mac[1].upper()
+        if second_char in ['2', '6', 'A', 'E']:
+            return "Randomized (Private) Address"
+
         prefix = mac.upper().replace(":", "")[:6]
         if prefix in self.vendor_cache: return self.vendor_cache[prefix]
         try:
-            # Using a free MAC API
             response = requests.get(f"https://api.macvendors.com/{mac}", timeout=1)
             if response.status_code == 200:
                 self.vendor_cache[prefix] = response.text
                 return response.text
         except: pass
-        return "Unknown"
+        return "Unknown Vendor"
 
     def scan_network(self):
         try:
@@ -142,8 +145,20 @@ class NetworkSniffer:
             if extra: data.update(extra)
             self.alert_callback(data)
 
+    def _update_info(self, mac, hostname=None, vendor=None):
+        db = SessionLocal()
+        try:
+            device = crud.get_device_by_mac(db, mac)
+            if device:
+                # Avoid redundant updates
+                if (hostname and device.hostname != hostname) or (vendor and device.vendor != vendor):
+                    crud.update_device_info(db, mac, hostname=hostname, vendor=vendor)
+                    if self.alert_callback:
+                        self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
+        finally: db.close()
+
     def process_packet(self, packet):
-        # 1. Handle ARP (Device discovery and Spoof detection)
+        # 1. ARP: Base Discovery
         if packet.haslayer(ARP):
             psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
             db = SessionLocal()
@@ -163,36 +178,50 @@ class NetworkSniffer:
                     else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
             finally: db.close()
 
-        # 2. Handle Hostname Discovery (NBNS for Windows, MDNS for Apple/Linux)
+        # 2. DHCP: High-Accuracy Discovery (Names + OS)
+        if packet.haslayer(DHCP):
+            mac = packet[Ether].src
+            hostname = None
+            options = packet[DHCP].options
+            for opt in options:
+                if isinstance(opt, tuple):
+                    if opt[0] == 'hostname':
+                        hostname = opt[1].decode()
+                    if opt[0] == 'vendor_class_id':
+                        v_id = opt[1].decode()
+                        self._update_info(mac, vendor=f"OS: {v_id}")
+            if hostname:
+                self._update_info(mac, hostname=hostname)
+
+        # 3. mDNS (UDP 5353) / NBNS (UDP 137)
         if packet.haslayer(NBNSQueryRequest):
             name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
-            ip = packet[IP].src if packet.haslayer(IP) else None
-            if name and ip:
-                self.queue_task(self._update_hostname_by_ip, ip, name)
+            mac = packet[Ether].src
+            if name: self._update_info(mac, hostname=name)
 
-        if packet.haslayer(DNS) and packet.haslayer(UDP) and packet[UDP].dport == 5353: # MDNS
-            try:
+        if packet.haslayer(UDP) and packet[UDP].dport == 5353:
+            mac = packet[Ether].src
+            if packet.haslayer(DNS) and packet[DNS].ancount > 0:
                 for i in range(packet[DNS].ancount):
                     res = packet[DNS].an[i]
-                    if res.type == 12: # PTR Record
+                    if res.type == 12: # PTR
                         name = res.rdata.decode().split(".")[0]
-                        ip = packet[IP].src if packet.haslayer(IP) else None
-                        if name and ip:
-                            self.queue_task(self._update_hostname_by_ip, ip, name)
-            except: pass
+                        if name: self._update_info(mac, hostname=name)
 
-    def _update_hostname_by_ip(self, db, ip, hostname):
-        device = crud.get_device_by_ip(db, ip)
-        if device and (not device.hostname or device.hostname != hostname):
-            crud.update_device_info(db, device.mac_address, hostname=hostname)
-            # Notify frontend of info update
-            if self.alert_callback:
-                self.alert_callback({"type": "INFO_UPDATE", "mac": device.mac_address, "hostname": hostname})
+        # 4. SSDP (UPnP) Discovery - UDP 1900
+        if packet.haslayer(UDP) and packet[UDP].dport == 1900:
+            mac = packet[Ether].src
+            payload = str(packet[UDP].payload)
+            if "SERVER:" in payload:
+                server_info = re.search(r"SERVER: (.*)\r\n", payload)
+                if server_info:
+                    self._update_info(mac, vendor=server_info.group(1))
 
     def run(self):
         try:
-            # Sniff ARP, NBNS, and MDNS
-            sniff(iface=self.interface, filter="arp or udp port 137 or udp port 5353", prn=self.process_packet, store=0, stop_filter=lambda x: self.stop_event.is_set())
+            # Sniff ARP, DHCP, NBNS, mDNS, SSDP
+            filter_str = "arp or port 67 or port 68 or port 137 or port 5353 or port 1900"
+            sniff(iface=self.interface, filter=filter_str, prn=self.process_packet, store=0, stop_filter=lambda x: self.stop_event.is_set())
         except Exception as e: print(f"[!] SNIFFER ERROR: {e}")
 
     def start(self):
