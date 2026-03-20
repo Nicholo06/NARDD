@@ -1,4 +1,4 @@
-from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, BOOTP
+from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, BOOTP, ICMP, sr1
 import threading
 import time
 import platform
@@ -89,14 +89,9 @@ class NetworkSniffer:
         return {"os": platform.system(), "is_linux": platform.system() == "Linux", "can_inject": True, "gateway": self.blocker.gateway_ip, "current_interface": self.interface or "Default"}
 
     def get_vendor(self, mac):
-        # 1. Randomized Check
         if mac[1].upper() in ['2', '6', 'A', 'E']: return "Randomized (Private) Address"
         prefix = mac.upper().replace(":", "")[:6]
         if prefix in self.vendor_cache: return self.vendor_cache[prefix]
-        # 2. Local Fallbacks for common brands if API fails
-        fallbacks = {"B827EB": "Raspberry Pi", "DCA632": "Raspberry Pi", "000C29": "VMware", "080027": "VirtualBox"}
-        if prefix in fallbacks: return fallbacks[prefix]
-        # 3. API Lookup
         try:
             res = requests.get(f"https://api.macvendors.com/{mac}", timeout=1)
             if res.status_code == 200:
@@ -106,14 +101,25 @@ class NetworkSniffer:
         return "Unknown Vendor"
 
     def interrogate_device(self, ip, mac):
-        """Perform active fingerprinting on a device."""
-        # 1. Reverse DNS
+        """Active Fingerprinting: OS & Device Detection"""
+        # 1. TTL Analysis (iOS/Linux=64, Windows=128)
         try:
-            name = socket.gethostbyaddr(ip)[0]
-            if name: self._update_info(mac, hostname=name.split('.')[0])
+            ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False, iface=self.interface)
+            if ans and ans.ttl <= 64:
+                self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
+            elif ans and ans.ttl > 64:
+                self._update_info(mac, vendor="Windows Device (TTL 128)")
         except: pass
 
-        # 2. NetBIOS Name Query (Windows/Lenovo)
+        # 2. Apple Lockdown Port Probe (Unique to iPhones/iPads)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex((ip, 62078)) == 0:
+                    self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc. (Lockdown Service)")
+        except: pass
+
+        # 3. NetBIOS Name Query (Lenovo/Windows)
         try:
             pkt = IP(dst=ip)/UDP(sport=137, dport=137)/NBNSNodeStatusRequest()
             ans = srp(Ether(dst=mac)/pkt, timeout=1, verbose=False, iface=self.interface)[0]
@@ -144,9 +150,14 @@ class NetworkSniffer:
         try:
             device = crud.get_device_by_mac(db, mac)
             if device:
+                # If we already have a specific vendor (Apple), don't overwrite with generic (Linux)
+                if vendor and "Apple" in (device.vendor or "") and "Apple" not in vendor:
+                    vendor = None
+                
                 if (hostname and device.hostname != hostname) or (vendor and device.vendor != vendor):
                     crud.update_device_info(db, mac, hostname=hostname, vendor=vendor)
-                    if self.alert_callback: self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
+                    if self.alert_callback:
+                        self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
         finally: db.close()
 
     def process_packet(self, packet):
@@ -159,7 +170,6 @@ class NetworkSniffer:
                     vendor = self.get_vendor(hwsrc)
                     crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc, vendor=vendor))
                     self.send_alert("NEW_DEVICE", "INFO", f"New device: {vendor} ({psrc})", {"mac": hwsrc, "ip": psrc, "vendor": vendor})
-                    # New device found? Interrogate it immediately in a background thread
                     threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
                 else:
                     if device.ip_address != psrc:
@@ -176,10 +186,6 @@ class NetworkSniffer:
                 if isinstance(opt, tuple):
                     if opt[0] == 'hostname': self._update_info(mac, hostname=opt[1].decode())
                     if opt[0] == 'vendor_class_id': self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
-
-        if packet.haslayer(NBNSQueryRequest):
-            name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
-            if name: self._update_info(packet[Ether].src, hostname=name)
 
     def run(self):
         try:
