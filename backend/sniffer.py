@@ -21,7 +21,7 @@ class DatabaseWorker(threading.Thread):
                 if task is None: break
                 db = SessionLocal()
                 try: task[0](db, *task[1], **task[2])
-                except: pass
+                except: pass # Suppress DB errors in worker
                 finally: db.close()
             except: pass
 
@@ -102,29 +102,25 @@ class NetworkSniffer:
 
     def interrogate_device(self, ip, mac):
         """Active Fingerprinting: OS & Device Detection"""
-        # 0. Gateway Check
         if ip == self.blocker.gateway_ip:
-            self._update_info(mac, hostname="Default Gateway", vendor="Network Router (Linux Kernel)")
+            self._update_info(mac, hostname="Default Gateway", vendor="Network Router")
             return
-
-        # 1. TTL Analysis (iOS/Linux=64, Windows=128)
+        # 1. TTL Analysis - Remove iface from sr1 to fix SyntaxWarning
         try:
-            ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False, iface=self.interface)
+            ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False)
             if ans and ans.ttl <= 64:
                 self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
             elif ans and ans.ttl > 64:
                 self._update_info(mac, vendor="Windows Device (TTL 128)")
         except: pass
-
-        # 2. Apple Lockdown Port Probe (Unique to iPhones/iPads)
+        # 2. Apple Lockdown Port Probe
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
                 if s.connect_ex((ip, 62078)) == 0:
-                    self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc. (Lockdown Service)")
+                    self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc.")
         except: pass
-
-        # 3. NetBIOS Name Query (Lenovo/Windows)
+        # 3. NetBIOS Name Query
         try:
             pkt = IP(dst=ip)/UDP(sport=137, dport=137)/NBNSNodeStatusRequest()
             ans = srp(Ether(dst=mac)/pkt, timeout=1, verbose=False, iface=self.interface)[0]
@@ -148,49 +144,54 @@ class NetworkSniffer:
         self.queue_task(crud.create_alert, schemas.AlertCreate(type=alert_type, severity=severity, message=message))
         if self.alert_callback:
             data = {"type": alert_type, "severity": severity, "message": message, "timestamp": datetime.utcnow().isoformat()}
-            if extra: data.update(extra); self.alert_callback(data)
+            if extra: data.update(extra)
+            self.alert_callback(data)
 
     def _update_info(self, mac, hostname=None, vendor=None):
         db = SessionLocal()
         try:
             device = crud.get_device_by_mac(db, mac)
             if device:
-                # If we already have a specific vendor (Apple), don't overwrite with generic (Linux)
-                if vendor and "Apple" in (device.vendor or "") and "Apple" not in vendor:
-                    vendor = None
-                
+                if vendor and "Apple" in (device.vendor or "") and "Apple" not in vendor: vendor = None
                 if (hostname and device.hostname != hostname) or (vendor and device.vendor != vendor):
                     crud.update_device_info(db, mac, hostname=hostname, vendor=vendor)
-                    if self.alert_callback:
-                        self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
+                    if self.alert_callback: self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
         finally: db.close()
 
     def process_packet(self, packet):
-        if packet.haslayer(ARP):
-            psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
-            db = SessionLocal()
-            try:
-                device = crud.get_device_by_mac(db, hwsrc)
-                if not device:
-                    vendor = self.get_vendor(hwsrc)
-                    crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc, vendor=vendor))
-                    self.send_alert("NEW_DEVICE", "INFO", f"New device: {vendor} ({psrc})", {"mac": hwsrc, "ip": psrc, "vendor": vendor})
-                    threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
-                else:
-                    if device.ip_address != psrc:
-                        other = crud.get_device_by_ip(db, psrc)
-                        if other and other.mac_address != hwsrc:
-                            if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
+        try:
+            if packet.haslayer(ARP):
+                psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
+                db = SessionLocal()
+                try:
+                    device = crud.get_device_by_mac(db, hwsrc)
+                    if not device:
+                        vendor = self.get_vendor(hwsrc)
+                        # Use try-except here to catch race condition duplicates
+                        try:
+                            crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc, vendor=vendor))
+                            self.send_alert("NEW_DEVICE", "INFO", f"New device: {vendor} ({psrc})", {"mac": hwsrc, "ip": psrc, "vendor": vendor})
+                            threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
+                        except: pass # Likely already created by another thread
+                    else:
+                        if device.ip_address != psrc:
+                            other = crud.get_device_by_ip(db, psrc)
+                            if other and other.mac_address != hwsrc:
+                                if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
+                            else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
                         else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
-                    else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
-            finally: db.close()
+                finally: db.close()
 
-        if packet.haslayer(DHCP):
-            mac = packet[Ether].src; options = packet[DHCP].options
-            for opt in options:
-                if isinstance(opt, tuple):
-                    if opt[0] == 'hostname': self._update_info(mac, hostname=opt[1].decode())
-                    if opt[0] == 'vendor_class_id': self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
+            if packet.haslayer(DHCP):
+                mac = packet[Ether].src; options = packet[DHCP].options
+                for opt in options:
+                    if isinstance(opt, tuple):
+                        if opt[0] == 'hostname': self._update_info(mac, hostname=opt[1].decode())
+                        if opt[0] == 'vendor_class_id': self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
+            if packet.haslayer(NBNSQueryRequest):
+                name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
+                if name: self._update_info(packet[Ether].src, hostname=name)
+        except: pass
 
     def run(self):
         try:
