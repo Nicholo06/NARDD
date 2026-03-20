@@ -1,6 +1,6 @@
 # 🛡️ NARDD: Network Anomaly & Rogue Device Detector
 
-**NARDD** is a professional-grade, real-time network security monitor and Intrusion Prevention System (IPS). Designed for both home and security research environments, it provides deep visibility into network traffic, identifies devices with high accuracy, and offers active mitigation against unauthorized actors.
+**NARDD** is a real-time network security monitor and Intrusion Prevention System (IPS). Designed for both home and security research environments, it provides deep visibility into network traffic, identifies devices with high accuracy, and offers active mitigation against unauthorized actors.
 
 ---
 
