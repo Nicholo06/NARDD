@@ -143,7 +143,8 @@ class NetworkSniffer:
         try:
             device = crud.get_device_by_mac(db, hwsrc)
             if not device:
-                self.queue_task(crud.create_device, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc))
+                # IMMEDIATE CREATE (No queue) for new devices to avoid race conditions
+                new_dev = crud.create_device(db, schemas.DeviceCreate(mac_address=hwsrc, ip_address=psrc))
                 self.send_alert("NEW_DEVICE", "INFO", f"New device: {hwsrc} ({psrc})", {"mac": hwsrc, "ip": psrc})
             else:
                 if device.ip_address != psrc:

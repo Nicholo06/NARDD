@@ -135,8 +135,15 @@ function updateDeviceInMemory(mac, ip) {
         dev.ip_address = ip;
         dev.last_seen = new Date().toISOString();
     } else {
-        fetchDevices();
-        return;
+        // Optimistically add the new device so it shows up instantly
+        devices.push({
+            mac_address: mac,
+            ip_address: ip,
+            is_trusted: false,
+            last_seen: new Date().toISOString()
+        });
+        // Still fetch in background to sync with DB
+        setTimeout(fetchDevices, 1000);
     }
     renderDevices();
 }
