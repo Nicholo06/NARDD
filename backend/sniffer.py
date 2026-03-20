@@ -106,6 +106,25 @@ class NetworkSniffer:
         self.alert_cooldown[key] = now
         return True
 
+    def scan_network(self):
+        """Actively scan the local network using ARP requests."""
+        try:
+            gw = self.blocker.gateway_ip
+            prefix = ".".join(gw.split(".")[:-1])
+            target = f"{prefix}.0/24"
+            print(f"[*] Actively scanning {target}...")
+            
+            # Using srp (Send/Receive packets at Layer 2)
+            from scapy.all import srp
+            ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=target), timeout=3, verbose=False, iface=self.interface)
+            
+            for snd, rcv in ans:
+                self.process_packet(rcv)
+            return len(ans)
+        except Exception as e:
+            print(f"[!] Scan Error: {e}")
+            return 0
+
     def queue_task(self, func, *args, **kwargs):
         self.db_queue.put((func, args, kwargs))
 

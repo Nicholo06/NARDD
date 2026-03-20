@@ -6,17 +6,19 @@ const liveAlertsContainer = document.getElementById('live-alerts-container');
 const historyAlertsContainer = document.getElementById('history-alerts-container');
 const alertCountEl = document.getElementById('alert-count');
 const refreshBtn = document.getElementById('refresh-btn');
+const scanBtn = document.getElementById('scan-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const advancedBadge = document.getElementById('advanced-badge');
 const liveTabBtn = document.getElementById('live-tab-btn');
 const historyTabBtn = document.getElementById('history-tab-btn');
+const interfaceSelect = document.getElementById('interface-select');
 
 let alertCount = 0;
 let ws;
 let isAdvancedMode = false;
 let blockedMacs = [];
-let devices = []; // In-memory state
+let devices = [];
 
 // Tab Logic
 liveTabBtn.onclick = () => {
@@ -42,8 +44,44 @@ async function checkConfig() {
             isAdvancedMode = true;
             advancedBadge.classList.remove('hidden');
         }
+        await fetchInterfaces(config.current_interface);
     } catch (e) { console.error(e); }
 }
+
+async function fetchInterfaces(current) {
+    try {
+        const response = await fetch(`${API_URL}/interfaces`);
+        const ifaces = await response.json();
+        interfaceSelect.innerHTML = '';
+        ifaces.forEach(iface => {
+            const opt = document.createElement('option');
+            opt.value = iface;
+            opt.textContent = iface;
+            if (iface === current) opt.selected = true;
+            interfaceSelect.appendChild(opt);
+        });
+    } catch (e) { console.error(e); }
+}
+
+interfaceSelect.onchange = async () => {
+    const iface = interfaceSelect.value;
+    statusText.textContent = "Switching Interface...";
+    await fetch(`${API_URL}/interfaces/set?iface=${iface}`, { method: 'POST' });
+    setTimeout(() => location.reload(), 1000);
+};
+
+scanBtn.onclick = async () => {
+    scanBtn.disabled = true;
+    scanBtn.textContent = "Scanning...";
+    try {
+        const response = await fetch(`${API_URL}/scan`, { method: 'POST' });
+        const result = await response.json();
+        console.log(result.message);
+        fetchDevices();
+    } catch (e) { console.error(e); }
+    scanBtn.disabled = false;
+    scanBtn.textContent = "Scan Network";
+};
 
 async function fetchBlocked() {
     try {
@@ -72,9 +110,8 @@ function connectWS() {
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         addAlert(data);
-        // Fast UI Update: Don't refetch everything, just update the single device
         if (data.mac) updateDeviceInMemory(data.mac, data.ip);
-        else fetchDevices(); // Fallback
+        else fetchDevices();
     };
     ws.onclose = () => {
         statusDot.className = "relative inline-flex rounded-full h-3 w-3 bg-red-500";
@@ -98,7 +135,7 @@ function updateDeviceInMemory(mac, ip) {
         dev.ip_address = ip;
         dev.last_seen = new Date().toISOString();
     } else {
-        fetchDevices(); // If it's a totally new device, we need the full object
+        fetchDevices();
         return;
     }
     renderDevices();

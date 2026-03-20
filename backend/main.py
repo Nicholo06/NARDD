@@ -87,6 +87,11 @@ def unblock_device(mac: str):
 def get_blocked():
     return list(net_sniffer.blocker.blocked_macs)
 
+@app.post("/scan")
+def scan_network():
+    count = net_sniffer.scan_network()
+    return {"message": f"Scan complete. Found {count} devices."}
+
 @app.get("/devices", response_model=list[schemas.Device])
 def get_devices(db: Session = Depends(database.get_db)):
     return crud.get_devices(db)
