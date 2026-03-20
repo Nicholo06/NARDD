@@ -1,104 +1,74 @@
-NARDD: Network Anomaly & Rogue Device Detector
-🎯 Project Vision
-A real-time network security monitor that detects unauthorized devices and ARP spoofing attacks. The system uses a Python backend for low-level packet sniffing and a JavaScript frontend for a security operations center (SOC) style dashboard.
+# 🛡️ NARDD: Network Anomaly & Rogue Device Detector
 
-🏗️ Technical Architecture
-1. File Structure
-The project should be organized as follows:
+**NARDD** is a high-performance, real-time network security monitor designed to detect unauthorized devices and mitigate ARP spoofing attacks. It features a robust Python backend for low-level packet sniffing and a modern, SOC-style web dashboard for live monitoring and device management.
 
-Plaintext
-nardd/
-├── backend/
-│   ├── main.py            # FastAPI entry point & WebSocket logic
-│   ├── database.py        # SQLAlchemy engine & session config
-│   ├── models.py          # SQLAlchemy ORM models
-│   ├── schemas.py         # Pydantic models for API validation
-│   ├── sniffer.py         # Scapy logic & background thread
-│   └── crud.py            # Database helper functions
-├── frontend/
-│   ├── index.html         # Main dashboard UI
-│   ├── app.js             # WebSocket client & State management
-│   └── styles.css         # Tailwind or Custom CSS
-└── requirements.txt       # scapy, fastapi, uvicorn, sqlalchemy
-2. Database Schema (SQLite)
-Table: devices
+---
 
-id: Integer (Primary Key)
+## 🚀 Core Features
 
-mac_address: String (Unique, Indexed)
+-   **Real-time Discovery**: Automatically identifies every device that communicates on your local network.
+-   **Advanced Threat Detection**: Monitors MAC-to-IP mappings and triggers **CRITICAL** alerts if an IP conflict (ARP Spoofing) is detected.
+-   **Intelligent Alerting**: Includes a 60-second cooldown per device to prevent notification spam.
+-   **Active Prevention (IPS)**: On supported hardware (Linux), enables **Active Blocking** to "black-hole" malicious devices.
+-   **Persistent History**: Saves all security events to a local SQLite database for forensic analysis.
+-   **High-Performance Architecture**: Uses a multi-threaded, queue-based database worker to handle busy networks without lag.
 
-ip_address: String
+---
 
-hostname: String (Optional)
+## 🛠️ Technology Stack
 
-is_trusted: Boolean (Default: False)
+-   **Backend**: Python (FastAPI, Scapy, SQLAlchemy)
+-   **Frontend**: Vanilla JS (ES6+), Tailwind CSS, WebSockets
+-   **Database**: SQLite
 
-last_seen: DateTime
+---
 
-Table: alerts
+## 📥 Installation
 
-id: Integer (Primary Key)
+### **1. Prerequisites**
+-   **Python 3.10+**
+-   **Npcap (Windows)**: Download from [npcap.com](https://npcap.com/). 
+    -   *CRITICAL: Check "Install Npcap in WinPcap API-compatible Mode" during installation.*
+-   **Root/Admin Privileges**: Required for raw packet sniffing.
 
-type: String (e.g., "NEW_DEVICE", "ARP_SPOOF")
+### **2. Setup**
+```bash
+# Clone the repository
+git clone https://github.com/your-username/nardd.git
+cd nardd
 
-severity: String (e.g., "INFO", "CRITICAL")
+# Install dependencies
+pip install -r requirements.txt
+pip install websockets
+```
 
-message: Text
+---
 
-timestamp: DateTime
+## 🚦 How to Use
 
-🧠 Logic Requirements
-A. The Sniffer (sniffer.py)
-Use scapy.sniff(filter="arp", store=0) to capture packets.
+### **1. Start the Backend**
+Open your terminal as **Administrator** (Windows) or use `sudo` (Linux) and run:
+```bash
+python -m uvicorn backend.main:app --reload
+```
+The server will start at `http://127.0.0.1:8000`.
 
-For every packet:
+### **2. Access the Dashboard**
+Open your browser and navigate to:
+👉 **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
 
-Extract psrc (Source IP) and hwsrc (Source MAC).
+### **3. Monitoring & Management**
+-   **Trusted Devices**: When a new device is detected, review it and click **"Trust"** if you recognize it.
+-   **Live Alerts**: Watch the sidebar for **NEW_DEVICE** or **ARP_SPOOF** events.
+-   **History**: Switch to the **HISTORY** tab to view past security events.
+-   **Blocking (Linux only)**: Click **"BLOCK"** on an untrusted device to disconnect it from the network.
 
-Query DB: Does this MAC exist?
+---
 
-If No: Create new entry in devices, mark is_trusted=False, and emit NEW_DEVICE alert via WebSocket.
+## ⚠️ Disclaimer
+This tool is for educational and personal network security monitoring purposes only. Only use NARDD on networks you own or have explicit permission to monitor.
 
-If Yes: Compare psrc with the stored ip_address.
+---
 
-If IPs differ, emit ARP_SPOOFING alert (Critical).
-
-Update last_seen timestamp.
-
-B. The API (main.py)
-Endpoint GET /devices: Returns all discovered devices.
-
-Endpoint PATCH /devices/{mac}/trust: Updates the is_trusted status.
-
-WebSocket /ws/alerts: Asynchronous broadcast for real-time security events.
-
-C. The Frontend (app.js)
-Connect to /ws/alerts on load.
-
-Maintain a stateful table of devices.
-
-Provide a "Trust" button that triggers the API call.
-
-Play a notification sound or show a toast alert when a CRITICAL alert arrives.
-
-🛠️ Implementation Commands for AI CLI
-Step 1: Backend Scaffolding
-
-"Generate backend/models.py and backend/database.py using SQLAlchemy for the schema defined in the README. Use a local network.db file."
-
-Step 2: Scapy Sniffer Logic
-
-"Generate backend/sniffer.py. Implement a Scapy sniffer that runs in a Python threading.Thread. Use the logic defined in Section 🧠 A. Ensure it calls crud.py functions to update the database."
-
-Step 3: FastAPI Integration
-
-"Generate backend/main.py using FastAPI. Include a lifespan event to start the sniffer thread on startup. Implement a WebSocket endpoint /ws/alerts that the sniffer can push data to."
-
-Step 4: Frontend UI
-
-"Build a modern, dark-themed dashboard in frontend/index.html and frontend/app.js. It should display a table of devices and a scrolling sidebar for 'Live Alerts' received via WebSockets."
-
-⚠️ Security & Permissions
-Accessing the raw network socket requires root/admin privileges.
-
-All Python commands must be executed with sudo (Linux/Mac) or "Run as Administrator" (Windows).
+## 📜 License
+MIT License. Feel free to use and improve!

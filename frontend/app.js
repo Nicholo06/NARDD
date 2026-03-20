@@ -9,7 +9,6 @@ const refreshBtn = document.getElementById('refresh-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const advancedBadge = document.getElementById('advanced-badge');
-
 const liveTabBtn = document.getElementById('live-tab-btn');
 const historyTabBtn = document.getElementById('history-tab-btn');
 
@@ -17,6 +16,7 @@ let alertCount = 0;
 let ws;
 let isAdvancedMode = false;
 let blockedMacs = [];
+let devices = []; // In-memory state
 
 // Tab Logic
 liveTabBtn.onclick = () => {
@@ -58,8 +58,7 @@ async function fetchAlertHistory() {
         const alerts = await response.json();
         historyAlertsContainer.innerHTML = '';
         alerts.forEach(alert => {
-            const div = createAlertElement(alert, false);
-            historyAlertsContainer.appendChild(div);
+            historyAlertsContainer.appendChild(createAlertElement(alert, false));
         });
     } catch (e) { console.error(e); }
 }
@@ -73,7 +72,9 @@ function connectWS() {
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         addAlert(data);
-        fetchDevices(); 
+        // Fast UI Update: Don't refetch everything, just update the single device
+        if (data.mac) updateDeviceInMemory(data.mac, data.ip);
+        else fetchDevices(); // Fallback
     };
     ws.onclose = () => {
         statusDot.className = "relative inline-flex rounded-full h-3 w-3 bg-red-500";
@@ -86,12 +87,24 @@ async function fetchDevices() {
     try {
         await fetchBlocked();
         const response = await fetch(`${API_URL}/devices`);
-        const devices = await response.json();
-        renderDevices(devices);
+        devices = await response.json();
+        renderDevices();
     } catch (error) { console.error(error); }
 }
 
-function renderDevices(devices) {
+function updateDeviceInMemory(mac, ip) {
+    const dev = devices.find(d => d.mac_address === mac);
+    if (dev) {
+        dev.ip_address = ip;
+        dev.last_seen = new Date().toISOString();
+    } else {
+        fetchDevices(); // If it's a totally new device, we need the full object
+        return;
+    }
+    renderDevices();
+}
+
+function renderDevices() {
     deviceTableBody.innerHTML = '';
     devices.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
 
@@ -149,8 +162,7 @@ function createAlertElement(alert, animate = true) {
 }
 
 function addAlert(alert) {
-    const div = createAlertElement(alert, true);
-    liveAlertsContainer.prepend(div);
+    liveAlertsContainer.prepend(createAlertElement(alert, true));
     alertCount++;
     alertCountEl.textContent = alertCount;
 }
