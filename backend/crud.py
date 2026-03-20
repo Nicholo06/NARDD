@@ -5,6 +5,9 @@ from . import models, schemas
 def get_device_by_mac(db: Session, mac_address: str):
     return db.query(models.Device).filter(models.Device.mac_address == mac_address).first()
 
+def get_device_by_ip(db: Session, ip_address: str):
+    return db.query(models.Device).filter(models.Device.ip_address == ip_address).first()
+
 def create_device(db: Session, device: schemas.DeviceCreate):
     db_device = models.Device(**device.model_dump())
     db.add(db_device)

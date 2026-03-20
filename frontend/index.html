@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NARDD Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="/static/styles.css">
     <style>
         .alert-new { @apply bg-blue-900 border-blue-500; }
         .alert-spoof { @apply bg-red-900 border-red-500; }
@@ -22,6 +22,7 @@
                 </svg>
             </div>
             <h1 class="text-2xl font-bold tracking-tight">NARDD <span class="text-sm font-normal text-gray-400">| Network Monitor</span></h1>
+            <span id="advanced-badge" class="hidden bg-red-900/40 text-red-400 text-[10px] px-2 py-0.5 rounded border border-red-800 font-mono">ADVANCED MODE</span>
         </div>
         <div id="connection-status" class="flex items-center space-x-2">
             <span class="relative flex h-3 w-3">
@@ -59,17 +60,27 @@
         </div>
 
         <!-- Sidebar (Live Alerts) -->
-        <aside class="w-80 bg-gray-800 border-l border-gray-700 flex flex-col">
-            <div class="p-4 border-b border-gray-700 font-semibold flex items-center justify-between">
-                <span>Live Security Alerts</span>
-                <span id="alert-count" class="bg-red-600 text-white text-xs px-2 py-0.5 rounded-full">0</span>
+        <aside class="w-96 bg-gray-800 border-l border-gray-700 flex flex-col">
+            <div class="p-4 border-b border-gray-700 flex items-center justify-between">
+                <div class="flex space-x-4">
+                    <button id="live-tab-btn" class="text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1">LIVE</button>
+                    <button id="history-tab-btn" class="text-sm font-bold text-gray-400 hover:text-gray-200 pb-1">HISTORY</button>
+                </div>
+                <span id="alert-count" class="bg-red-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">0</span>
             </div>
-            <div id="alerts-container" class="flex-1 overflow-y-auto p-4 space-y-3">
-                <!-- Alerts will be inserted here -->
+            
+            <!-- Live Alerts Container -->
+            <div id="live-alerts-container" class="flex-1 overflow-y-auto p-4 space-y-3">
+                <!-- Live alerts show here -->
+            </div>
+
+            <!-- History Alerts Container (Hidden by default) -->
+            <div id="history-alerts-container" class="hidden flex-1 overflow-y-auto p-4 space-y-3 bg-gray-900/50">
+                <!-- Past alerts from DB show here -->
             </div>
         </aside>
     </main>
 
-    <script src="app.js"></script>
+    <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,34 +1,82 @@
-const API_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000/ws/alerts';
+const API_URL = `${window.location.protocol}//${window.location.host}`;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/alerts`;
 
 const deviceTableBody = document.getElementById('device-table-body');
-const alertsContainer = document.getElementById('alerts-container');
+const liveAlertsContainer = document.getElementById('live-alerts-container');
+const historyAlertsContainer = document.getElementById('history-alerts-container');
 const alertCountEl = document.getElementById('alert-count');
 const refreshBtn = document.getElementById('refresh-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
+const advancedBadge = document.getElementById('advanced-badge');
+
+const liveTabBtn = document.getElementById('live-tab-btn');
+const historyTabBtn = document.getElementById('history-tab-btn');
 
 let alertCount = 0;
 let ws;
+let isAdvancedMode = false;
+let blockedMacs = [];
+
+// Tab Logic
+liveTabBtn.onclick = () => {
+    liveAlertsContainer.classList.remove('hidden');
+    historyAlertsContainer.classList.add('hidden');
+    liveTabBtn.className = "text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1";
+    historyTabBtn.className = "text-sm font-bold text-gray-400 hover:text-gray-200 pb-1";
+};
+
+historyTabBtn.onclick = () => {
+    liveAlertsContainer.classList.add('hidden');
+    historyAlertsContainer.classList.remove('hidden');
+    historyTabBtn.className = "text-sm font-bold text-indigo-400 border-b-2 border-indigo-400 pb-1";
+    liveTabBtn.className = "text-sm font-bold text-gray-400 hover:text-gray-200 pb-1";
+    fetchAlertHistory();
+};
+
+async function checkConfig() {
+    try {
+        const response = await fetch(`${API_URL}/config`);
+        const config = await response.json();
+        if (config.is_linux) {
+            isAdvancedMode = true;
+            advancedBadge.classList.remove('hidden');
+        }
+    } catch (e) { console.error(e); }
+}
+
+async function fetchBlocked() {
+    try {
+        const response = await fetch(`${API_URL}/blocked`);
+        blockedMacs = await response.json();
+    } catch (e) { console.error(e); }
+}
+
+async function fetchAlertHistory() {
+    try {
+        const response = await fetch(`${API_URL}/alerts`);
+        const alerts = await response.json();
+        historyAlertsContainer.innerHTML = '';
+        alerts.forEach(alert => {
+            const div = createAlertElement(alert, false);
+            historyAlertsContainer.appendChild(div);
+        });
+    } catch (e) { console.error(e); }
+}
 
 function connectWS() {
     ws = new WebSocket(WS_URL);
-
     ws.onopen = () => {
-        statusDot.classList.remove('bg-red-500');
-        statusDot.classList.add('bg-green-500');
+        statusDot.className = "relative inline-flex rounded-full h-3 w-3 bg-green-500";
         statusText.textContent = 'Connected';
     };
-
     ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         addAlert(data);
-        fetchDevices(); // Refresh list on new event
+        fetchDevices(); 
     };
-
     ws.onclose = () => {
-        statusDot.classList.remove('bg-green-500');
-        statusDot.classList.add('bg-red-500');
+        statusDot.className = "relative inline-flex rounded-full h-3 w-3 bg-red-500";
         statusText.textContent = 'Disconnected (Retrying...)';
         setTimeout(connectWS, 3000);
     };
@@ -36,12 +84,11 @@ function connectWS() {
 
 async function fetchDevices() {
     try {
+        await fetchBlocked();
         const response = await fetch(`${API_URL}/devices`);
         const devices = await response.json();
         renderDevices(devices);
-    } catch (error) {
-        console.error('Error fetching devices:', error);
-    }
+    } catch (error) { console.error(error); }
 }
 
 function renderDevices(devices) {
@@ -50,66 +97,80 @@ function renderDevices(devices) {
 
     devices.forEach(device => {
         const tr = document.createElement('tr');
-        tr.className = 'hover:bg-gray-700/30 transition';
+        const isBlocked = blockedMacs.includes(device.mac_address);
+        tr.className = `transition ${isBlocked ? 'bg-red-900/20' : 'hover:bg-gray-700/30'}`;
         
         const lastSeen = new Date(device.last_seen).toLocaleTimeString();
         const statusClass = device.is_trusted ? 'text-green-400' : 'text-yellow-400';
         const statusIcon = device.is_trusted ? '✓ Trusted' : '⚠ Untrusted';
 
+        let actionHtml = `
+            <button onclick="toggleTrust('${device.mac_address}', ${!device.is_trusted})" class="text-indigo-400 hover:text-indigo-300 text-sm font-semibold mr-4">
+                ${device.is_trusted ? 'Revoke Trust' : 'Trust'}
+            </button>
+        `;
+
+        if (isAdvancedMode) {
+            actionHtml += `
+                <button onclick="toggleBlock('${device.mac_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-sm font-semibold">
+                    ${isBlocked ? 'UNBLOCK' : 'BLOCK'}
+                </button>
+            `;
+        }
+
         tr.innerHTML = `
-            <td class="px-6 py-4 font-mono text-xs text-gray-300">${device.mac_address}</td>
+            <td class="px-6 py-4 font-mono text-xs text-gray-300">
+                ${device.mac_address}
+                ${isBlocked ? '<span class="ml-2 bg-red-600 text-[8px] px-1 rounded text-white font-bold">BLOCKED</span>' : ''}
+            </td>
             <td class="px-6 py-4 text-gray-100">${device.ip_address}</td>
             <td class="px-6 py-4 ${statusClass} font-medium">${statusIcon}</td>
             <td class="px-6 py-4 text-gray-400 text-sm">${lastSeen}</td>
-            <td class="px-6 py-4">
-                <button onclick="toggleTrust('${device.mac_address}', ${!device.is_trusted})" class="text-indigo-400 hover:text-indigo-300 text-sm font-semibold">
-                    ${device.is_trusted ? 'Revoke Trust' : 'Trust Device'}
-                </button>
-            </td>
+            <td class="px-6 py-4">${actionHtml}</td>
         `;
         deviceTableBody.appendChild(tr);
     });
 }
 
-async function toggleTrust(mac, isTrusted) {
-    try {
-        await fetch(`${API_URL}/devices/${mac}/trust?is_trusted=${isTrusted}`, {
-            method: 'PATCH'
-        });
-        fetchDevices();
-    } catch (error) {
-        console.error('Error updating trust status:', error);
-    }
+function createAlertElement(alert, animate = true) {
+    const div = document.createElement('div');
+    const isCritical = alert.severity === 'CRITICAL';
+    const time = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+    
+    div.className = `p-3 rounded-lg border text-sm ${animate ? 'animate-pulse' : ''} ${isCritical ? 'bg-red-900/40 border-red-700' : 'bg-indigo-900/20 border-indigo-800'}`;
+    div.innerHTML = `
+        <div class="flex justify-between items-start mb-1">
+            <span class="font-bold uppercase text-[10px] ${isCritical ? 'text-red-400' : 'text-indigo-400'}">${alert.type}</span>
+            <span class="text-[9px] text-gray-500">${time}</span>
+        </div>
+        <p class="text-gray-300 leading-tight text-xs">${alert.message}</p>
+    `;
+    return div;
 }
 
 function addAlert(alert) {
-    const div = document.createElement('div');
-    const isCritical = alert.severity === 'CRITICAL';
-    
-    div.className = `p-3 rounded-lg border text-sm animate-pulse ${isCritical ? 'bg-red-900/50 border-red-700' : 'bg-indigo-900/30 border-indigo-800'}`;
-    
-    const time = new Date().toLocaleTimeString();
-    
-    div.innerHTML = `
-        <div class="flex justify-between items-start mb-1">
-            <span class="font-bold uppercase text-xs ${isCritical ? 'text-red-400' : 'text-indigo-400'}">${alert.type}</span>
-            <span class="text-[10px] text-gray-500">${time}</span>
-        </div>
-        <p class="text-gray-200 leading-tight">${alert.message}</p>
-    `;
-    
-    alertsContainer.prepend(div);
+    const div = createAlertElement(alert, true);
+    liveAlertsContainer.prepend(div);
     alertCount++;
     alertCountEl.textContent = alertCount;
+}
 
-    if (isCritical) {
-        // Notification sound could be added here
-        console.warn('SECURITY ALERT:', alert.message);
-    }
+async function toggleTrust(mac, isTrusted) {
+    await fetch(`${API_URL}/devices/${mac}/trust?is_trusted=${isTrusted}`, { method: 'PATCH' });
+    fetchDevices();
+}
+
+async function toggleBlock(mac, shouldBlock) {
+    const endpoint = shouldBlock ? 'block' : 'unblock';
+    await fetch(`${API_URL}/devices/${mac}/${endpoint}`, { method: 'POST' });
+    fetchDevices();
 }
 
 refreshBtn.onclick = fetchDevices;
 
-// Initial load
-fetchDevices();
-connectWS();
+async function init() {
+    await checkConfig();
+    fetchDevices();
+    connectWS();
+}
+init();
