@@ -102,6 +102,11 @@ class NetworkSniffer:
 
     def interrogate_device(self, ip, mac):
         """Active Fingerprinting: OS & Device Detection"""
+        # 0. Gateway Check
+        if ip == self.blocker.gateway_ip:
+            self._update_info(mac, hostname="Default Gateway", vendor="Network Router (Linux Kernel)")
+            return
+
         # 1. TTL Analysis (iOS/Linux=64, Windows=128)
         try:
             ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False, iface=self.interface)
