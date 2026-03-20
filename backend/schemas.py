@@ -8,6 +8,8 @@ class DeviceBase(BaseModel):
     hostname: Optional[str] = None
     vendor: Optional[str] = None
     is_trusted: bool = False
+    is_blocked: bool = False
+    is_online: bool = True
 
 class DeviceCreate(DeviceBase):
     pass

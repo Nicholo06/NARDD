@@ -41,8 +41,27 @@ def update_device_trust(db: Session, mac_address: str, is_trusted: bool):
         db.refresh(db_device)
     return db_device
 
+def update_device_blocked(db: Session, mac_address: str, is_blocked: bool):
+    db_device = get_device_by_mac(db, mac_address)
+    if db_device:
+        db_device.is_blocked = is_blocked
+        db.commit()
+        db.refresh(db_device)
+    return db_device
+
+def update_device_online(db: Session, mac_address: str, is_online: bool):
+    db_device = get_device_by_mac(db, mac_address)
+    if db_device:
+        db_device.is_online = is_online
+        db.commit()
+        db.refresh(db_device)
+    return db_device
+
 def get_devices(db: Session, skip: int = 0, limit: int = 100):
     return db.query(models.Device).offset(skip).limit(limit).all()
+
+def get_blocked_devices(db: Session):
+    return db.query(models.Device).filter(models.Device.is_blocked == True).all()
 
 def create_alert(db: Session, alert: schemas.AlertCreate):
     db_alert = models.Alert(**alert.model_dump())

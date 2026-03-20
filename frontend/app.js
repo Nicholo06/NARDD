@@ -17,7 +17,6 @@ const interfaceSelect = document.getElementById('interface-select');
 let alertCount = 0;
 let ws;
 let isAdvancedMode = false;
-let blockedMacs = [];
 let devices = [];
 
 // Tab Logic
@@ -74,19 +73,12 @@ scanBtn.onclick = async () => {
     scanBtn.disabled = true;
     scanBtn.textContent = "Scanning...";
     try {
-        const response = await fetch(`${API_URL}/scan`, { method: 'POST' });
+        await fetch(`${API_URL}/scan`, { method: 'POST' });
         fetchDevices();
     } catch (e) { console.error(e); }
     scanBtn.disabled = false;
     scanBtn.textContent = "Scan Network";
 };
-
-async function fetchBlocked() {
-    try {
-        const response = await fetch(`${API_URL}/blocked`);
-        blockedMacs = await response.json();
-    } catch (e) { console.error(e); }
-}
 
 async function fetchAlertHistory() {
     try {
@@ -114,6 +106,12 @@ function connectWS() {
                 if (data.vendor) dev.vendor = data.vendor;
                 renderDevices();
             }
+        } else if (data.type === "STATUS_UPDATE") {
+            const dev = devices.find(d => d.mac_address === data.mac);
+            if (dev) {
+                dev.is_online = data.online;
+                renderDevices();
+            }
         } else {
             addAlert(data);
             if (data.mac) updateDeviceInMemory(data.mac, data.ip, data.vendor);
@@ -129,7 +127,6 @@ function connectWS() {
 
 async function fetchDevices() {
     try {
-        await fetchBlocked();
         const response = await fetch(`${API_URL}/devices`);
         devices = await response.json();
         renderDevices();
@@ -141,6 +138,7 @@ function updateDeviceInMemory(mac, ip, vendor) {
     if (dev) {
         dev.ip_address = ip;
         dev.last_seen = new Date().toISOString();
+        dev.is_online = true;
         if (vendor) dev.vendor = vendor;
     } else {
         devices.push({
@@ -148,6 +146,8 @@ function updateDeviceInMemory(mac, ip, vendor) {
             ip_address: ip,
             vendor: vendor || "Unknown",
             is_trusted: false,
+            is_online: true,
+            is_blocked: false,
             last_seen: new Date().toISOString()
         });
         setTimeout(fetchDevices, 1000);
@@ -157,26 +157,32 @@ function updateDeviceInMemory(mac, ip, vendor) {
 
 function renderDevices() {
     deviceTableBody.innerHTML = '';
-    devices.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+    // Online devices first, then sort by last seen
+    devices.sort((a, b) => {
+        if (a.is_online !== b.is_online) return b.is_online - a.is_online;
+        return new Date(b.last_seen) - new Date(a.last_seen);
+    });
 
     devices.forEach(device => {
         const tr = document.createElement('tr');
-        const isBlocked = blockedMacs.some(b => b[0] === device.mac_address && b[1] === device.ip_address);
-        tr.className = `transition ${isBlocked ? 'bg-red-900/20' : 'hover:bg-gray-700/30'}`;
+        const isBlocked = device.is_blocked;
+        const isOffline = !device.is_online;
+        
+        tr.className = `transition ${isBlocked ? 'bg-red-900/20' : (isOffline ? 'opacity-50 grayscale' : 'hover:bg-gray-700/30')}`;
         
         const lastSeen = new Date(device.last_seen).toLocaleTimeString();
         const statusClass = device.is_trusted ? 'text-green-400' : 'text-yellow-400';
         const statusIcon = device.is_trusted ? '✓ Trusted' : '⚠ Untrusted';
 
         let actionHtml = `
-            <button onclick="toggleTrust('${device.mac_address}', ${!device.is_trusted})" class="text-indigo-400 hover:text-indigo-300 text-sm font-semibold mr-4">
-                ${device.is_trusted ? 'Revoke Trust' : 'Trust'}
+            <button onclick="toggleTrust('${device.mac_address}', ${!device.is_trusted})" class="text-indigo-400 hover:text-indigo-300 text-xs font-semibold mr-4">
+                ${device.is_trusted ? 'Revoke' : 'Trust'}
             </button>
         `;
 
         if (isAdvancedMode) {
             actionHtml += `
-                <button onclick="toggleBlock('${device.mac_address}', '${device.ip_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-sm font-semibold">
+                <button onclick="toggleBlock('${device.mac_address}', '${device.ip_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-xs font-semibold">
                     ${isBlocked ? 'UNBLOCK' : 'BLOCK'}
                 </button>
             `;
@@ -186,17 +192,22 @@ function renderDevices() {
         const vendorName = device.vendor || "Unknown Vendor";
 
         tr.innerHTML = `
-            <td class="px-6 py-4">
-                <div class="text-sm font-bold text-gray-100">${deviceName}</div>
-                <div class="text-[10px] text-gray-500 font-mono">${device.mac_address}</div>
+            <td class="px-6 py-3">
+                <div class="flex items-center space-x-2">
+                    <div class="w-2 h-2 rounded-full ${isOffline ? 'bg-gray-600' : 'bg-green-500 animate-pulse'}"></div>
+                    <div>
+                        <div class="text-sm font-bold text-gray-100">${deviceName}</div>
+                        <div class="text-[10px] text-gray-500 font-mono">${device.mac_address}</div>
+                    </div>
+                </div>
             </td>
-            <td class="px-6 py-4">
+            <td class="px-6 py-3">
                 <div class="text-sm text-gray-200">${device.ip_address}</div>
                 <div class="text-[10px] text-indigo-400 font-medium">${vendorName}</div>
             </td>
-            <td class="px-6 py-4 ${statusClass} font-medium text-xs">${statusIcon}</td>
-            <td class="px-6 py-4 text-gray-400 text-xs">${lastSeen}</td>
-            <td class="px-6 py-4">${actionHtml}</td>
+            <td class="px-6 py-3 ${statusClass} font-medium text-[10px] uppercase">${statusIcon}</td>
+            <td class="px-6 py-3 text-gray-400 text-[10px]">${lastSeen}</td>
+            <td class="px-6 py-3">${actionHtml}</td>
         `;
         deviceTableBody.appendChild(tr);
     });
@@ -204,7 +215,7 @@ function renderDevices() {
 
 function createAlertElement(alert, animate = true) {
     const div = document.createElement('div');
-    const isCritical = alert.severity === 'CRITICAL';
+    const isCritical = alert.severity === 'CRITICAL' || alert.severity === 'WARNING';
     const time = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
     div.className = `p-3 rounded-lg border text-sm ${animate ? 'animate-pulse' : ''} ${isCritical ? 'bg-red-900/40 border-red-700' : 'bg-indigo-900/20 border-indigo-800'}`;
     div.innerHTML = `

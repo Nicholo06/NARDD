@@ -74,12 +74,14 @@ def set_interface(iface: str):
     return {"message": f"Interface changed to {iface}"}
 
 @app.post("/devices/{mac}/block")
-def block_device(mac: str, ip: str):
+def block_device(mac: str, ip: str, db: Session = Depends(database.get_db)):
+    crud.update_device_blocked(db, mac, True)
     net_sniffer.blocker.block(mac, ip)
     return {"message": f"Blocking {mac} ({ip})"}
 
 @app.post("/devices/{mac}/unblock")
-def unblock_device(mac: str, ip: str):
+def unblock_device(mac: str, ip: str, db: Session = Depends(database.get_db)):
+    crud.update_device_blocked(db, mac, False)
     net_sniffer.blocker.unblock(mac, ip)
     return {"message": f"Unblocking {mac} ({ip})"}
 

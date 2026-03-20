@@ -1,4 +1,4 @@
-from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, BOOTP, ICMP, sr1
+from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, ICMP, sr1, get_if_addr
 import threading
 import time
 import platform
@@ -27,32 +27,42 @@ class DatabaseWorker(threading.Thread):
 
 class ActiveBlocker:
     def __init__(self, interface=None):
-        self.blocked_macs = set()
+        self.blocked_macs = {} # (mac, ip) -> timestamp
         self.stop_event = threading.Event()
-        self.thread = None
         self.interface = interface
         self.gateway_ip = self._detect_gateway()
         self.gateway_mac = None
         self.local_mac = None
+        self._load_from_db()
+
     def _detect_gateway(self):
         try: return conf.route.route("0.0.0.0")[2]
         except: return "192.168.1.1"
+
+    def _load_from_db(self):
+        db = SessionLocal()
+        try:
+            blocked = crud.get_blocked_devices(db)
+            for d in blocked:
+                self.blocked_macs[(d.mac_address, d.ip_address)] = time.time()
+        finally: db.close()
+
     def refresh_network_info(self, interface):
         self.interface = interface
         try:
             self.local_mac = get_if_hwaddr(self.interface or conf.iface)
             self.gateway_mac = getmacbyip(self.gateway_ip)
         except: pass
+
     def start(self):
-        if not self.thread:
-            self.stop_event.clear()
-            self.thread = threading.Thread(target=self.run, daemon=True)
-            self.thread.start()
-    def block(self, mac, ip): self.blocked_macs.add((mac, ip))
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def block(self, mac, ip): self.blocked_macs[(mac, ip)] = time.time()
     def unblock(self, mac, ip):
         if (mac, ip) in self.blocked_macs:
-            self.blocked_macs.remove((mac, ip))
+            del self.blocked_macs[(mac, ip)]
             for _ in range(5): self.restore(mac, ip)
+
     def restore(self, target_mac, target_ip):
         if not self.gateway_mac: return
         try:
@@ -60,11 +70,12 @@ class ActiveBlocker:
             pkt2 = ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=target_ip, hwsrc=target_mac)
             send(pkt1, verbose=False, iface=self.interface); send(pkt2, verbose=False, iface=self.interface)
         except: pass
+
     def run(self):
         while not self.stop_event.is_set():
             if not self.gateway_mac or not self.local_mac:
                 self.refresh_network_info(self.interface); time.sleep(3); continue
-            for mac, ip in list(self.blocked_macs):
+            for (mac, ip) in list(self.blocked_macs.keys()):
                 try:
                     p1 = ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.local_mac)
                     p2 = ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=ip, hwsrc=self.local_mac)
@@ -79,11 +90,13 @@ class NetworkSniffer:
         self.db_queue = queue.Queue()
         self.db_worker = DatabaseWorker(self.db_queue); self.db_worker.start()
         self.interface = None
-        self.blocker = ActiveBlocker(); self.blocker.start()
+        self.blocker = ActiveBlocker()
+        self.blocker.start()
         self.alert_cooldown = {}
         self.vendor_cache = {}
-        # Tracking for scan detection
-        self.scan_tracker = {} # mac -> {ips: set, last_reset: timestamp}
+        self.scan_tracker = {}
+        # Start Heartbeat Thread
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
 
     def get_interfaces(self): return get_if_list()
     def set_interface(self, iface): self.interface = iface; self.blocker.refresh_network_info(iface)
@@ -95,6 +108,7 @@ class NetworkSniffer:
         prefix = mac.upper().replace(":", "")[:6]
         if prefix in self.vendor_cache: return self.vendor_cache[prefix]
         try:
+            time.sleep(0.5) # Basic rate limiting
             res = requests.get(f"https://api.macvendors.com/{mac}", timeout=1)
             if res.status_code == 200:
                 self.vendor_cache[prefix] = res.text
@@ -124,13 +138,31 @@ class NetworkSniffer:
 
     def scan_network(self):
         try:
-            gw = self.blocker.gateway_ip; prefix = ".".join(gw.split(".")[:-1]); target = f"{prefix}.0/24"
+            # Dynamic Subnet Detection
+            local_ip = get_if_addr(self.interface or conf.iface)
+            prefix = ".".join(local_ip.split(".")[:-1])
+            target = f"{prefix}.0/24"
             ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=target), timeout=3, verbose=False, iface=self.interface)
             for _, rcv in ans: 
                 self.process_packet(rcv)
                 threading.Thread(target=self.interrogate_device, args=(rcv[ARP].psrc, rcv[ARP].hwsrc), daemon=True).start()
             return len(ans)
         except: return 0
+
+    def heartbeat_loop(self):
+        """Check for offline devices every 2 minutes."""
+        while not self.stop_event.is_set():
+            time.sleep(120)
+            db = SessionLocal()
+            try:
+                devices = crud.get_devices(db)
+                now = datetime.utcnow()
+                for d in devices:
+                    if d.last_seen < now - timedelta(minutes=5):
+                        if d.is_online:
+                            crud.update_device_online(db, d.mac_address, False)
+                            if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": d.mac_address, "online": False})
+            finally: db.close()
 
     def queue_task(self, func, *args, **kwargs): self.db_queue.put((func, args, kwargs))
     def send_alert(self, alert_type, severity, message, extra=None):
@@ -160,31 +192,11 @@ class NetworkSniffer:
 
     def process_packet(self, packet):
         try:
-            # 1. ARP Monitoring & Scan Detection
             if packet.haslayer(ARP):
                 psrc, hwsrc = packet[ARP].psrc, packet[ARP].hwsrc
-                pdst = packet[ARP].pdst
-                
                 db = SessionLocal()
                 try:
                     device = crud.get_device_by_mac(db, hwsrc)
-                    
-                    # Scan Detection for Untrusted Devices
-                    if device and not device.is_trusted and packet[ARP].op == 1: # ARP Request
-                        if hwsrc not in self.scan_tracker:
-                            self.scan_tracker[hwsrc] = {"ips": set(), "start": time.time()}
-                        
-                        tracker = self.scan_tracker[hwsrc]
-                        tracker["ips"].add(pdst)
-                        
-                        # If device pings more than 10 IPs in 30 seconds
-                        if len(tracker["ips"]) > 10:
-                            if self.should_alert(f"SCAN_{hwsrc}", cooldown=300):
-                                self.send_alert("SCAN_DETECTION", "WARNING", f"Untrusted device {hwsrc} is scanning the network!", {"mac": hwsrc})
-                            tracker["ips"].clear() # Reset
-                        elif time.time() - tracker["start"] > 30:
-                            tracker["ips"].clear(); tracker["start"] = time.time()
-
                     if not device:
                         vendor = self.get_vendor(hwsrc)
                         try:
@@ -193,20 +205,24 @@ class NetworkSniffer:
                             threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
                         except: pass
                     else:
+                        # Mark device as online if it was offline
+                        if not device.is_online:
+                            crud.update_device_online(db, hwsrc, True)
+                            if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": hwsrc, "online": True})
+                        
                         if device.ip_address != psrc:
                             other = crud.get_device_by_ip(db, psrc)
                             if other and other.mac_address != hwsrc:
                                 if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
                             else:
-                                # Alert if an UNTRUSTED device moves IPs
-                                if not device.is_trusted:
-                                    if self.should_alert(f"MOVE_{hwsrc}"):
-                                        self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved from {device.ip_address} to {psrc}")
-                                self.queue_task(crud.update_device_ip, hwsrc, psrc)
-                        else: self.queue_task(crud.update_device_ip, hwsrc, psrc)
+                                if not device.is_trusted and self.should_alert(f"MOVE_{hwsrc}"):
+                                    self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved to {psrc}")
+                                crud.update_device_ip(db, hwsrc, psrc)
+                        else:
+                            # Update last_seen to keep it 'online'
+                            crud.update_device_ip(db, hwsrc, psrc)
                 finally: db.close()
 
-            # 2. Other Protocols (DHCP, NBNS, etc.)
             if packet.haslayer(DHCP):
                 mac = packet[Ether].src; options = packet[DHCP].options
                 for opt in options:
