@@ -182,7 +182,7 @@ function renderDevices() {
 
         if (isAdvancedMode) {
             actionHtml += `
-                <button onclick="toggleBlock('${device.mac_address}', '${device.ip_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-xs font-semibold">
+                <button onclick="toggleBlock('${device.mac_address}', ${!isBlocked})" class="${isBlocked ? 'text-red-400' : 'text-gray-400 hover:text-red-400'} text-xs font-semibold">
                     ${isBlocked ? 'UNBLOCK' : 'BLOCK'}
                 </button>
             `;
@@ -239,9 +239,9 @@ async function toggleTrust(mac, isTrusted) {
     fetchDevices();
 }
 
-async function toggleBlock(mac, ip, shouldBlock) {
-    const endpoint = shouldBlock ? 'block' : 'unblock';
-    await fetch(`${API_URL}/devices/${mac}/${endpoint}?ip=${ip}`, { method: 'POST' });
+async function toggleBlock(mac, isBlocked) {
+    const endpoint = isBlocked ? 'block' : 'unblock';
+    await fetch(`${API_URL}/devices/${mac}/${endpoint}`, { method: 'POST' });
     fetchDevices();
 }
 

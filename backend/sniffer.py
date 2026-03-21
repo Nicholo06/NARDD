@@ -27,7 +27,7 @@ class DatabaseWorker(threading.Thread):
 
 class ActiveBlocker:
     def __init__(self, interface=None):
-        self.blocked_macs = {} # (mac, ip) -> timestamp
+        self.blocked_macs = set() # Store MACs to be blocked
         self.stop_event = threading.Event()
         self.interface = interface
         self.gateway_ip = self._detect_gateway()
@@ -44,7 +44,7 @@ class ActiveBlocker:
         try:
             blocked = crud.get_blocked_devices(db)
             for d in blocked:
-                self.blocked_macs[(d.mac_address, d.ip_address)] = time.time()
+                self.blocked_macs.add(d.mac_address)
         finally: db.close()
 
     def refresh_network_info(self, interface):
@@ -57,11 +57,17 @@ class ActiveBlocker:
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
 
-    def block(self, mac, ip): self.blocked_macs[(mac, ip)] = time.time()
-    def unblock(self, mac, ip):
-        if (mac, ip) in self.blocked_macs:
-            del self.blocked_macs[(mac, ip)]
-            for _ in range(5): self.restore(mac, ip)
+    def block(self, mac): self.blocked_macs.add(mac)
+    def unblock(self, mac):
+        if mac in self.blocked_macs:
+            self.blocked_macs.remove(mac)
+            # Try to restore once
+            db = SessionLocal()
+            try:
+                device = crud.get_device_by_mac(db, mac)
+                if device and device.ip_address:
+                    for _ in range(3): self.restore(mac, device.ip_address)
+            finally: db.close()
 
     def restore(self, target_mac, target_ip):
         if not self.gateway_mac: return
@@ -75,15 +81,33 @@ class ActiveBlocker:
         while not self.stop_event.is_set():
             if not self.gateway_mac or not self.local_mac:
                 self.refresh_network_info(self.interface); time.sleep(3); continue
-            for (mac, ip) in list(self.blocked_macs.keys()):
-                try:
-                    p1 = ARP(op=2, pdst=ip, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.local_mac)
-                    p2 = ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=ip, hwsrc=self.local_mac)
-                    send(p1, verbose=False, iface=self.interface); send(p2, verbose=False, iface=self.interface)
-                except: pass
-            time.sleep(0.5)
+            
+            db = SessionLocal()
+            try:
+                for mac in list(self.blocked_macs):
+                    device = crud.get_device_by_mac(db, mac)
+                    if device and device.ip_address and device.is_online:
+                        try:
+                            p1 = ARP(op=2, pdst=device.ip_address, hwdst=mac, psrc=self.gateway_ip, hwsrc=self.local_mac)
+                            p2 = ARP(op=2, pdst=self.gateway_ip, hwdst=self.gateway_mac, psrc=device.ip_address, hwsrc=self.local_mac)
+                            send(p1, verbose=False, iface=self.interface); send(p2, verbose=False, iface=self.interface)
+                        except: pass
+            finally: db.close()
+            time.sleep(1)
 
 class NetworkSniffer:
+    # OS Fingerprints based on DHCP Option 55 (Parameter Request List)
+    DHCP_FINGERPRINTS = {
+        "1,3,6,15,26,28,51,58,59": "Android Device",
+        "1,3,6,15,28,33,51,58,59": "Android Device (Samsung/Pixel)",
+        "1,3,6,15,119,252,95,44,46": "Apple iOS Device",
+        "1,3,6,15,121,249,252,43": "Apple MacOS / iOS Device",
+        "1,3,6,15,31,33,43,44,46,47,119,121,249,252": "Windows Device",
+        "1,121,3,6,15,31,33,43,44,46,47,119,121,249,252": "Windows 10/11 Device",
+        "1,3,6,15,119,121": "Linux Device / Ubuntu",
+        "1,28,2,3,15,6,119,12,44,47,26,121,42": "Linux / generic Desktop"
+    }
+
     def __init__(self, alert_callback=None):
         self.alert_callback = alert_callback
         self.stop_event = threading.Event()
@@ -120,20 +144,39 @@ class NetworkSniffer:
         if ip == self.blocker.gateway_ip:
             self._update_info(mac, hostname="Default Gateway", vendor="Network Router")
             return
+        
+        # Check mDNS / DNS-SD if possible (common on Android/Apple)
+        try:
+            # Simple port scan for common services to help ID
+            common_ports = {62078: "Apple Inc.", 8008: "Google Cast (Android)", 8009: "Google Cast (Android)"}
+            for port, label in common_ports.items():
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex((ip, port)) == 0:
+                        self._update_info(mac, vendor=label)
+                        break
+        except: pass
+
         try:
             ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False)
-            if ans and ans.ttl <= 64: self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
-            elif ans and ans.ttl > 64: self._update_info(mac, vendor="Windows Device (TTL 128)")
+            if ans:
+                if ans.ttl <= 64: 
+                    # Could be Linux or Android or iOS
+                    db = SessionLocal()
+                    dev = crud.get_device_by_mac(db, mac)
+                    if dev and "Android" not in (dev.vendor or "") and "Apple" not in (dev.vendor or ""):
+                        self._update_info(mac, vendor="Linux-based Device (TTL 64)")
+                    db.close()
+                elif ans.ttl > 64: 
+                    self._update_info(mac, vendor="Windows Device (TTL 128)")
         except: pass
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                if s.connect_ex((ip, 62078)) == 0: self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc.")
-        except: pass
+        
         try:
             pkt = IP(dst=ip)/UDP(sport=137, dport=137)/NBNSNodeStatusRequest()
             ans = srp(Ether(dst=mac)/pkt, timeout=1, verbose=False, iface=self.interface)[0]
-            if ans: self._update_info(mac, hostname=ans[0][1].getlayer(NBNSNodeStatusRequest).NAME.decode().strip())
+            if ans: 
+                name = ans[0][1].getlayer(NBNSNodeStatusRequest).NAME.decode().strip()
+                self._update_info(mac, hostname=name)
         except: pass
 
     def scan_network(self):
@@ -184,7 +227,13 @@ class NetworkSniffer:
         try:
             device = crud.get_device_by_mac(db, mac)
             if device:
-                if vendor and "Apple" in (device.vendor or "") and "Apple" not in vendor: vendor = None
+                # Prioritize specific OS info over generic TTL/Vendor info
+                if vendor:
+                    # Don't overwrite Android with Linux or vice-versa if we already have good info
+                    current_vendor = device.vendor or ""
+                    if "Android" in current_vendor and ("Linux" in vendor or "Apple" in vendor): vendor = None
+                    if "Apple" in current_vendor and ("Linux" in vendor or "Android" in vendor): vendor = None
+                
                 if (hostname and device.hostname != hostname) or (vendor and device.vendor != vendor):
                     crud.update_device_info(db, mac, hostname=hostname, vendor=vendor)
                     if self.alert_callback: self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
@@ -205,7 +254,6 @@ class NetworkSniffer:
                             threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
                         except: pass
                     else:
-                        # Mark device as online if it was offline
                         if not device.is_online:
                             crud.update_device_online(db, hwsrc, True)
                             if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": hwsrc, "online": True})
@@ -215,20 +263,29 @@ class NetworkSniffer:
                             if other and other.mac_address != hwsrc:
                                 if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
                             else:
-                                if not device.is_trusted and self.should_alert(f"MOVE_{hwsrc}"):
-                                    self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved to {psrc}")
                                 crud.update_device_ip(db, hwsrc, psrc)
                         else:
-                            # Update last_seen to keep it 'online'
                             crud.update_device_ip(db, hwsrc, psrc)
                 finally: db.close()
 
             if packet.haslayer(DHCP):
                 mac = packet[Ether].src; options = packet[DHCP].options
+                detected_vendor = None
                 for opt in options:
                     if isinstance(opt, tuple):
                         if opt[0] == 'hostname': self._update_info(mac, hostname=opt[1].decode())
-                        if opt[0] == 'vendor_class_id': self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
+                        if opt[0] == 'vendor_class_id':
+                            v_id = opt[1].decode().lower()
+                            if "android" in v_id: detected_vendor = "Android Device"
+                            elif "apple" in v_id or "ios" in v_id: detected_vendor = "Apple Device"
+                            elif "windows" in v_id: detected_vendor = "Windows Device"
+                            else: self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
+                        if opt[0] == 'parameter_request_list':
+                            prl = ",".join(map(str, opt[1]))
+                            if prl in self.DHCP_FINGERPRINTS:
+                                detected_vendor = self.DHCP_FINGERPRINTS[prl]
+                if detected_vendor: self._update_info(mac, vendor=detected_vendor)
+
             if packet.haslayer(NBNSQueryRequest):
                 name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
                 if name: self._update_info(packet[Ether].src, hostname=name)
