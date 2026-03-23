@@ -1,4 +1,4 @@
-from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, ICMP, sr1, get_if_addr
+from scapy.all import sniff, ARP, send, Ether, conf, get_if_list, srp, get_if_hwaddr, getmacbyip, NBNSQueryRequest, NBNSNodeStatusRequest, UDP, DNS, IP, DHCP, BOOTP, ICMP, sr1, get_if_addr
 import threading
 import time
 import platform
@@ -27,7 +27,7 @@ class DatabaseWorker(threading.Thread):
 
 class ActiveBlocker:
     def __init__(self, interface=None):
-        self.blocked_macs = {} # (mac, ip) -> timestamp
+        self.blocked_macs = {}
         self.stop_event = threading.Event()
         self.interface = interface
         self.gateway_ip = self._detect_gateway()
@@ -43,8 +43,7 @@ class ActiveBlocker:
         db = SessionLocal()
         try:
             blocked = crud.get_blocked_devices(db)
-            for d in blocked:
-                self.blocked_macs[(d.mac_address, d.ip_address)] = time.time()
+            for d in blocked: self.blocked_macs[(d.mac_address, d.ip_address)] = time.time()
         finally: db.close()
 
     def refresh_network_info(self, interface):
@@ -54,8 +53,7 @@ class ActiveBlocker:
             self.gateway_mac = getmacbyip(self.gateway_ip)
         except: pass
 
-    def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
+    def start(self): threading.Thread(target=self.run, daemon=True).start()
 
     def block(self, mac, ip): self.blocked_macs[(mac, ip)] = time.time()
     def unblock(self, mac, ip):
@@ -94,8 +92,6 @@ class NetworkSniffer:
         self.blocker.start()
         self.alert_cooldown = {}
         self.vendor_cache = {}
-        self.scan_tracker = {}
-        # Start Heartbeat Thread
         threading.Thread(target=self.heartbeat_loop, daemon=True).start()
 
     def get_interfaces(self): return get_if_list()
@@ -108,7 +104,7 @@ class NetworkSniffer:
         prefix = mac.upper().replace(":", "")[:6]
         if prefix in self.vendor_cache: return self.vendor_cache[prefix]
         try:
-            time.sleep(0.5) # Basic rate limiting
+            time.sleep(0.5)
             res = requests.get(f"https://api.macvendors.com/{mac}", timeout=1)
             if res.status_code == 200:
                 self.vendor_cache[prefix] = res.text
@@ -117,31 +113,48 @@ class NetworkSniffer:
         return "Unknown Vendor"
 
     def interrogate_device(self, ip, mac):
+        """OS-Agnostic Active Fingerprinting"""
         if ip == self.blocker.gateway_ip:
             self._update_info(mac, hostname="Default Gateway", vendor="Network Router")
             return
+
+        # 1. TTL Check (Base Kernel Guess)
         try:
             ans = sr1(IP(dst=ip)/ICMP(), timeout=1, verbose=False)
-            if ans and ans.ttl <= 64: self._update_info(mac, vendor="Apple iOS / Linux (TTL 64)")
-            elif ans and ans.ttl > 64: self._update_info(mac, vendor="Windows Device (TTL 128)")
+            if ans:
+                if ans.ttl <= 64: self._update_info(mac, vendor="Linux-based (Android/IoT/Unix)")
+                else: self._update_info(mac, vendor="Windows-based Device")
         except: pass
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                if s.connect_ex((ip, 62078)) == 0: self._update_info(mac, hostname="iPhone / iPad", vendor="Apple Inc.")
-        except: pass
+
+        # 2. Port Probing (Service Analysis)
+        probes = [
+            (62078, "iPhone / iPad", "Apple iOS Device"), # Apple Lockdown
+            (5555, "Android Device", "Android (ADB)"),    # ADB over Wi-Fi
+            (445, "Windows/Server", "Microsoft-DS (SMB)"), # SMB (Windows/Linux)
+            (80, "IoT / Web Device", None)                # HTTP
+        ]
+        for port, h_hint, v_hint in probes:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    if s.connect_ex((ip, port)) == 0:
+                        self._update_info(mac, hostname=h_hint, vendor=v_hint)
+                        if port in [62078, 5555]: break # Found definitive mobile OS
+            except: pass
+
+        # 3. NetBIOS (Windows/Lenovo)
         try:
             pkt = IP(dst=ip)/UDP(sport=137, dport=137)/NBNSNodeStatusRequest()
             ans = srp(Ether(dst=mac)/pkt, timeout=1, verbose=False, iface=self.interface)[0]
-            if ans: self._update_info(mac, hostname=ans[0][1].getlayer(NBNSNodeStatusRequest).NAME.decode().strip())
+            if ans:
+                name = ans[0][1].getlayer(NBNSNodeStatusRequest).NAME.decode().strip()
+                self._update_info(mac, hostname=name)
         except: pass
 
     def scan_network(self):
         try:
-            # Dynamic Subnet Detection
             local_ip = get_if_addr(self.interface or conf.iface)
-            prefix = ".".join(local_ip.split(".")[:-1])
-            target = f"{prefix}.0/24"
+            prefix = ".".join(local_ip.split(".")[:-1]); target = f"{prefix}.0/24"
             ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=target), timeout=3, verbose=False, iface=self.interface)
             for _, rcv in ans: 
                 self.process_packet(rcv)
@@ -150,7 +163,6 @@ class NetworkSniffer:
         except: return 0
 
     def heartbeat_loop(self):
-        """Check for offline devices every 2 minutes."""
         while not self.stop_event.is_set():
             time.sleep(120)
             db = SessionLocal()
@@ -158,10 +170,9 @@ class NetworkSniffer:
                 devices = crud.get_devices(db)
                 now = datetime.utcnow()
                 for d in devices:
-                    if d.last_seen < now - timedelta(minutes=5):
-                        if d.is_online:
-                            crud.update_device_online(db, d.mac_address, False)
-                            if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": d.mac_address, "online": False})
+                    if d.last_seen < now - timedelta(minutes=5) and d.is_online:
+                        crud.update_device_online(db, d.mac_address, False)
+                        if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": d.mac_address, "online": False})
             finally: db.close()
 
     def queue_task(self, func, *args, **kwargs): self.db_queue.put((func, args, kwargs))
@@ -184,7 +195,14 @@ class NetworkSniffer:
         try:
             device = crud.get_device_by_mac(db, mac)
             if device:
-                if vendor and "Apple" in (device.vendor or "") and "Apple" not in vendor: vendor = None
+                # Priority Logic: Don't let generic TTL info overwrite specific probes
+                if vendor and "Linux-based" in (device.vendor or "") and "Android" in vendor:
+                    pass # Allow upgrade to Android
+                elif vendor and "Linux-based" in (device.vendor or "") and "Apple" in vendor:
+                    pass # Allow upgrade to Apple
+                elif vendor and ("Apple" in (device.vendor or "") or "Android" in (device.vendor or "")) and "Linux-based" in vendor:
+                    vendor = None # Block downgrade back to generic Linux
+
                 if (hostname and device.hostname != hostname) or (vendor and device.vendor != vendor):
                     crud.update_device_info(db, mac, hostname=hostname, vendor=vendor)
                     if self.alert_callback: self.alert_callback({"type": "INFO_UPDATE", "mac": mac, "hostname": hostname or device.hostname, "vendor": vendor or device.vendor})
@@ -205,30 +223,34 @@ class NetworkSniffer:
                             threading.Thread(target=self.interrogate_device, args=(psrc, hwsrc), daemon=True).start()
                         except: pass
                     else:
-                        # Mark device as online if it was offline
                         if not device.is_online:
                             crud.update_device_online(db, hwsrc, True)
                             if self.alert_callback: self.alert_callback({"type": "STATUS_UPDATE", "mac": hwsrc, "online": True})
-                        
                         if device.ip_address != psrc:
                             other = crud.get_device_by_ip(db, psrc)
                             if other and other.mac_address != hwsrc:
                                 if self.should_alert(f"SPOOF_{psrc}"): self.send_alert("ARP_SPOOF", "CRITICAL", f"IP Conflict: {psrc}")
                             else:
                                 if not device.is_trusted and self.should_alert(f"MOVE_{hwsrc}"):
-                                    self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved to {psrc}")
+                                    self.send_alert("SUSPICIOUS_MOVE", "WARNING", f"Untrusted device {hwsrc} moved")
                                 crud.update_device_ip(db, hwsrc, psrc)
-                        else:
-                            # Update last_seen to keep it 'online'
-                            crud.update_device_ip(db, hwsrc, psrc)
+                        else: crud.update_device_ip(db, hwsrc, psrc)
                 finally: db.close()
 
             if packet.haslayer(DHCP):
-                mac = packet[Ether].src; options = packet[DHCP].options
+                mac = packet[Ether].src; hostname = None; options = packet[DHCP].options
                 for opt in options:
                     if isinstance(opt, tuple):
-                        if opt[0] == 'hostname': self._update_info(mac, hostname=opt[1].decode())
-                        if opt[0] == 'vendor_class_id': self._update_info(mac, vendor=f"OS: {opt[1].decode()}")
+                        if opt[0] == 'hostname': hostname = opt[1].decode()
+                        if opt[0] == 'vendor_class_id':
+                            v_id = opt[1].decode().lower()
+                            if "android" in v_id: self._update_info(mac, vendor="Android Device")
+                            else: self._update_info(mac, vendor=f"OS: {v_id}")
+                if hostname:
+                    self._update_info(mac, hostname=hostname)
+                    if "android" in hostname.lower() or "galaxy" in hostname.lower() or "samsung" in hostname.lower():
+                        self._update_info(mac, vendor="Samsung Android Device")
+
             if packet.haslayer(NBNSQueryRequest):
                 name = packet[NBNSQueryRequest].QUESTION_NAME.decode().strip()
                 if name: self._update_info(packet[Ether].src, hostname=name)
